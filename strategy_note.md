@@ -1,4 +1,4 @@
-# Strategy Note
+# Strategy Note -v
 
 This tutorial submission uses a simple market-making and mean-reversion strategy for the two available products: `EMERALDS` and `TOMATOES`.
 
