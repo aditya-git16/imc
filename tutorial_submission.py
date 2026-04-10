@@ -3,7 +3,6 @@ from typing import Dict, List
 
 from datamodel import Order, OrderDepth, TradingState
 
-
 class Trader:
     # Given in resources
     POSITION_LIMITS: Dict[str, int] = {
@@ -11,16 +10,23 @@ class Trader:
         "TOMATOES": 80,
     }
 
+    # Inferred from csv data
     EMERALDS_FAIR_VALUE = 10000
+    # How many previous mid_price to average from behind the current mid_price
     HISTORY_LENGTH = 12
 
     def run(self, state: TradingState):
         trader_state = self._load_state(state.traderData)
+        # Dictionary of orders by product
         orders_by_product: Dict[str, List[Order]] = {}
-
+        # For each product, build orders
+        # The items() method returns a view object. The view object contains the key-value pairs of the dictionary, as tuples in a list.
         for product, order_depth in state.order_depths.items():
+            # Get the current position for the product, if product key is missing use 0 as default
             position = state.position.get(product, 0)
+            # Estimate the fair value for the product
             fair_value = self._estimate_fair_value(product, order_depth, trader_state)
+            # Build orders for the product
             orders = self._build_orders(product, order_depth, fair_value, position)
             orders_by_product[product] = orders
 
@@ -55,20 +61,15 @@ class Trader:
 
         if mid_price is not None:
             history.append(mid_price)
+            # Keep only the most recent HISTORY_LENGTH entries in `history`
+            # `history[:-N]` selects all older elements except the last N, and `del` removes them in place.
             del history[:-self.HISTORY_LENGTH]
 
         if history:
+            # average of last 12 mid_prices for tomatoes
             return round(sum(history) / len(history))
-
+        # If no history, return a default value of 5000
         return 5000
-
-    def _mid_price(self, order_depth: OrderDepth):
-        if not order_depth.buy_orders or not order_depth.sell_orders:
-            return None
-
-        best_bid = max(order_depth.buy_orders)
-        best_ask = min(order_depth.sell_orders)
-        return (best_bid + best_ask) / 2
 
     def _build_orders(
         self,
