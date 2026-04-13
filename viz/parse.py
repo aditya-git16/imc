@@ -1,10 +1,15 @@
 """Parse IMC Prosperity submission `.log` files into tidy dataframes.
 
-A `.log` file is JSON with four keys:
+Supported formats:
+
+1. **API JSON** — an object with keys:
     submissionId   : str
     activitiesLog  : str   — semicolon-separated CSV of order-book snapshots
     logs           : list  — [{sandboxLog, lambdaLog, timestamp}, ...]
     tradeHistory   : list  — [{timestamp, buyer, seller, symbol, price, quantity}, ...]
+
+2. **prosperity3bt text** — files written by `prosperity3bt --out` (same layout jmerle's
+   visualizer loads): `Sandbox logs:` … `Activities log:` … optional `Trade History:`.
 
 The helpers here return DataFrames keyed on `timestamp` (in game ticks).
 Own trades are identified by `buyer == 'SUBMISSION'` or `seller == 'SUBMISSION'`.
@@ -12,6 +17,7 @@ Own trades are identified by `buyer == 'SUBMISSION'` or `seller == 'SUBMISSION'`
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -37,8 +43,12 @@ def load(path: str | Path) -> LogBundle:
     from . import derive  # local import to avoid circular dependency
 
     path = Path(path)
-    with path.open() as f:
-        raw = json.load(f)
+    text = path.read_text(encoding="utf-8")
+    stripped = text.lstrip("\ufeff").lstrip()
+    if stripped.startswith("Sandbox logs:"):
+        raw = _parse_prosperity3bt_text(text)
+    else:
+        raw = json.loads(text)
 
     prices = _parse_prices(raw["activitiesLog"])
     trades = _parse_trades(raw.get("tradeHistory", []))
@@ -63,6 +73,94 @@ def load(path: str | Path) -> LogBundle:
         submission_id=raw.get("submissionId", ""),
         products=products,
     )
+
+
+def _parse_prosperity3bt_text(text: str) -> dict:
+    """Convert prosperity3bt / jmerle-style text logs into the API JSON shape."""
+    text = text.replace("\r\n", "\n")
+    if "Sandbox logs:" not in text or "Activities log:" not in text:
+        raise ValueError("Not a prosperity3bt text log (missing Sandbox logs / Activities log headers)")
+
+    sandbox_blob = text.split("Sandbox logs:", 1)[1].split("Activities log:", 1)[0].strip()
+
+    after_activities = text.split("Activities log:", 1)[1].lstrip("\n")
+    trade_marker = "\n\n\n\n\nTrade History:"
+    if trade_marker in after_activities:
+        activities_csv, trade_tail = after_activities.split(trade_marker, 1)
+        activities_csv = activities_csv.strip()
+        trade_tail = trade_tail.strip()
+        trade_history = _loads_json_with_trailing_commas(trade_tail) if trade_tail else []
+    else:
+        activities_csv = after_activities.strip()
+        trade_history = []
+
+    logs: list[dict] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(sandbox_blob):
+        while idx < len(sandbox_blob) and sandbox_blob[idx].isspace():
+            idx += 1
+        if idx >= len(sandbox_blob):
+            break
+        obj, end = decoder.raw_decode(sandbox_blob, idx)
+        logs.append(obj)
+        idx = end
+
+    return {
+        "submissionId": "",
+        "activitiesLog": activities_csv,
+        "logs": logs,
+        "tradeHistory": trade_history,
+    }
+
+
+def _loads_json_with_trailing_commas(blob: str):
+    """prosperity3bt trade JSON mimics JS (trailing commas); stdlib json rejects those."""
+    cleaned = re.sub(r",(\s*[\]}])", r"\1", blob)
+    return json.loads(cleaned)
+
+
+def _iter_dv_json_objects(text: str):
+    """Yield dicts that contain a top-level \"DV\" key (standalone lines or embedded in flush output)."""
+    start = 0
+    while True:
+        i = text.find('{"DV"', start)
+        if i == -1:
+            return
+        try:
+            obj, end = json.JSONDecoder().raw_decode(text, i)
+        except json.JSONDecodeError:
+            start = i + 1
+            continue
+        if isinstance(obj, dict) and "DV" in obj:
+            yield obj
+        start = end
+
+
+def _iter_dv_from_prosperity_flush(text: str):
+    """Logger.flush prints one JSON array; the last element is a string containing {\"DV\": ...}."""
+    if "DV" not in text or not text.strip().startswith("["):
+        return
+    try:
+        outer = json.loads(text)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(outer, list):
+        return
+    for part in outer:
+        if not isinstance(part, str) or '"DV"' not in part:
+            continue
+        try:
+            inner = json.loads(part.strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(inner, dict) and "DV" in inner:
+            yield inner
+
+
+def _dv_objects_from_lambda(text: str):
+    yield from _iter_dv_json_objects(text)
+    yield from _iter_dv_from_prosperity_flush(text)
 
 
 def _parse_prices(text: str) -> pd.DataFrame:
@@ -104,20 +202,14 @@ def _parse_sandbox(entries: list[dict]) -> pd.DataFrame:
 
 
 def _parse_decisions(entries: list[dict]) -> pd.DataFrame:
-    """Pull `DV` lines out of lambdaLog text blobs emitted by Trader.run."""
+    """Pull `DV` payloads out of lambdaLog text (standalone prints or embedded in Logger.flush output)."""
     rows: list[dict] = []
     for entry in entries:
         text = entry.get("lambdaLog") or ""
-        if '"DV"' not in text:
+        # Standalone prints include `"DV"`; Logger.flush embeds DV inside escaped JSON (no bare `"DV"` substring).
+        if "DV" not in text:
             continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not (line.startswith("{") and '"DV"' in line):
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for obj in _dv_objects_from_lambda(text):
             dv = obj.get("DV") or {}
             t = dv.get("t")
             for product, d in (dv.get("d") or {}).items():

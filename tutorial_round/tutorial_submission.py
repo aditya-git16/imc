@@ -3,6 +3,11 @@ from typing import Dict, List
 
 from datamodel import Order, OrderDepth, TradingState
 
+from prosperity_logger import Logger
+
+logger = Logger()
+
+
 class Trader:
     # Given in resources
     POSITION_LIMITS: Dict[str, int] = {
@@ -33,12 +38,14 @@ class Trader:
             orders_by_product[product] = orders
             decisions[product] = decision
 
-        # Prefix `DV` lets the viz layer pick these lines out of lambdaLog without
-        # being fooled by arbitrary prints elsewhere in the algorithm.
-        print(json.dumps({"DV": {"t": state.timestamp, "d": decisions}}, separators=(",", ":")))
+        # Prefix `DV` lets the local viz (`viz/`) extract fair value / quotes from lambdaLog.
+        # It must go through logger.print so it is bundled into the official log line from
+        # logger.flush (required by jmerle's visualizer and prosperity3bt output).
+        logger.print(json.dumps({"DV": {"t": state.timestamp, "d": decisions}}, separators=(",", ":")))
 
         trader_data = json.dumps(trader_state, separators=(",", ":"))
         conversions = 0
+        logger.flush(state, orders_by_product, conversions, trader_data)
         return orders_by_product, conversions, trader_data
 
     def _load_state(self, trader_data: str) -> Dict[str, List[float]]:
@@ -142,3 +149,11 @@ class Trader:
             "skew": int(inventory_skew),
         }
         return orders, decision
+
+    @staticmethod
+    def _mid_price(order_depth: OrderDepth) -> int | None:
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return None
+        best_bid = max(order_depth.buy_orders)
+        best_ask = min(order_depth.sell_orders)
+        return (best_bid + best_ask) // 2

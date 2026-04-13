@@ -15,6 +15,11 @@ Three stacked panels sharing a timestamp axis:
 Hovering any plot prints the algorithm's sandbox/lambda log for the nearest
 tick underneath.
 
+## Log formats
+
+- **Submission JSON** — export from the Prosperity site (the shape described in `parse.py`).
+- **prosperity3bt text** — output from `prosperity3bt ... --out path/to/run.log` (same file you load into jmerle’s visualizer). Your trader should use the official `Logger` + `logger.flush()` pattern so both tools see valid `lambdaLog` rows; emit custom `{"DV":...}` via `logger.print()` so this dashboard still gets fair-value overlays.
+
 ## Install & run
 
 ```bash
