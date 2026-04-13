@@ -19,6 +19,8 @@ class Trader:
         trader_state = self._load_state(state.traderData)
         # Dictionary of orders by product
         orders_by_product: Dict[str, List[Order]] = {}
+        # Per-tick decision snapshot emitted for offline visualisation (see viz/).
+        decisions: Dict[str, Dict[str, int]] = {}
         # For each product, build orders
         # The items() method returns a view object. The view object contains the key-value pairs of the dictionary, as tuples in a list.
         for product, order_depth in state.order_depths.items():
@@ -27,8 +29,13 @@ class Trader:
             # Estimate the fair value for the product
             fair_value = self._estimate_fair_value(product, order_depth, trader_state)
             # Build orders for the product
-            orders = self._build_orders(product, order_depth, fair_value, position)
+            orders, decision = self._build_orders(product, order_depth, fair_value, position)
             orders_by_product[product] = orders
+            decisions[product] = decision
+
+        # Prefix `DV` lets the viz layer pick these lines out of lambdaLog without
+        # being fooled by arbitrary prints elsewhere in the algorithm.
+        print(json.dumps({"DV": {"t": state.timestamp, "d": decisions}}, separators=(",", ":")))
 
         trader_data = json.dumps(trader_state, separators=(",", ":"))
         conversions = 0
@@ -77,7 +84,7 @@ class Trader:
         order_depth: OrderDepth,
         fair_value: int,
         position: int,
-    ) -> List[Order]:
+    ):
         orders: List[Order] = []
         limit = self.POSITION_LIMITS[product]
 
@@ -125,4 +132,13 @@ class Trader:
             quote_size = min(sell_capacity, 8)
             orders.append(Order(product, passive_ask, -quote_size))
 
-        return orders
+        decision = {
+            "fv": int(fair_value),
+            "bt": int(buy_threshold),
+            "st": int(sell_threshold),
+            "pb": int(passive_bid),
+            "pa": int(passive_ask),
+            "pos": int(position),
+            "skew": int(inventory_skew),
+        }
+        return orders, decision
