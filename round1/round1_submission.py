@@ -2,7 +2,8 @@
 
 Design (take–clear–make, per product):
   1. Estimate a fair value (FV):
-     - OSMIUM: constant 10000 (data std is ~5; mean is 10000 across all 3 days).
+     - OSMIUM: anchor to 10000, but blend in a short micro-price history so we
+       track small intraday drifts without overreacting to single-tick noise.
      - PEPPER_ROOT: derive from the "market maker" quotes on the book.
        The book has one retail layer (best bid/ask, small size) and a deeper
        MM layer at a fixed offset. The midpoint of the highest-volume bid and
@@ -156,14 +157,17 @@ class Trader:
         "INTARIAN_PEPPER_ROOT": 80,
     }
 
-    # OSMIUM is a stable rainforest-resin style asset; fair value is constant.
+    # OSMIUM is stable around 10000, but a short micro-price average captures
+    # small intraday shifts better than a fully static anchor.
     OSMIUM_FAIR_VALUE = 10000
+    OSMIUM_HISTORY = 8
+    OSMIUM_ADAPTIVE_WEIGHT = 0.8
 
     # Minimum volume to treat a level as a "market-maker" quote (vs retail fill).
-    MM_VOLUME_THRESHOLD = 15
+    MM_VOLUME_THRESHOLD = 18
 
     # History length for PEPPER_ROOT fair-value smoothing (ticks).
-    PEPPER_HISTORY = 4
+    PEPPER_HISTORY = 5
 
     # Per-product config: (take_edge, clear_edge, make_edge, make_size_cap)
     # - take_edge: take a resting order only if price is >= this many ticks inside FV.
@@ -207,15 +211,19 @@ class Trader:
     # ------------------------------------------------------------------ state
 
     def _load_state(self, trader_data: str) -> Dict[str, List[float]]:
-        default = {"INTARIAN_PEPPER_ROOT": []}
+        default = {
+            "ASH_COATED_OSMIUM": [],
+            "INTARIAN_PEPPER_ROOT": [],
+        }
         if not trader_data:
             return default
         try:
             data = json.loads(trader_data)
         except json.JSONDecodeError:
             return default
-        if "INTARIAN_PEPPER_ROOT" not in data or not isinstance(data["INTARIAN_PEPPER_ROOT"], list):
-            data["INTARIAN_PEPPER_ROOT"] = []
+        for product in default:
+            if product not in data or not isinstance(data[product], list):
+                data[product] = []
         return data
 
     # ----------------------------------------------------------- fair value
@@ -227,7 +235,20 @@ class Trader:
         trader_state: Dict[str, List[float]],
     ) -> float | None:
         if product == "ASH_COATED_OSMIUM":
-            return float(self.OSMIUM_FAIR_VALUE)
+            # Start from the long-run 10000 anchor, but let a short rolling
+            # micro-price average carry most of the signal. This stays adaptive
+            # without hard-coding a fully static fair value.
+            micro = self._micro_price(order_depth)
+            history = trader_state.setdefault(product, [])
+            if micro is not None:
+                history.append(micro)
+                del history[: -self.OSMIUM_HISTORY]
+
+            adaptive_anchor = sum(history) / len(history) if history else float(self.OSMIUM_FAIR_VALUE)
+            return (
+                (1.0 - self.OSMIUM_ADAPTIVE_WEIGHT) * self.OSMIUM_FAIR_VALUE
+                + self.OSMIUM_ADAPTIVE_WEIGHT * adaptive_anchor
+            )
 
         # PEPPER_ROOT: use the midpoint of the largest-volume bid/ask as the
         # instantaneous MM-anchored price, then smooth with a short moving
@@ -244,6 +265,7 @@ class Trader:
         if not history:
             return None
         return sum(history) / len(history)
+
 
     def _mm_mid_price(self, order_depth: OrderDepth) -> float | None:
         """Midpoint of the thickest bid and thickest ask (filters retail fills)."""
@@ -265,6 +287,20 @@ class Trader:
             return None
         return (max(order_depth.buy_orders) + min(order_depth.sell_orders)) / 2
 
+    @staticmethod
+    def _micro_price(order_depth: OrderDepth) -> float | None:
+        """Volume-weighted mid: price leans toward the side with LESS liquidity."""
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return None
+        best_bid = max(order_depth.buy_orders)
+        best_ask = min(order_depth.sell_orders)
+        bid_vol = order_depth.buy_orders[best_bid]
+        ask_vol = -order_depth.sell_orders[best_ask]
+        total = bid_vol + ask_vol
+        if total <= 0:
+            return (best_bid + best_ask) / 2
+        return (best_bid * ask_vol + best_ask * bid_vol) / total
+
     # ---------------------------------------------------------- order build
 
     def _build_orders(
@@ -276,8 +312,15 @@ class Trader:
     ):
         limit = self.POSITION_LIMITS[product]
         take_edge, clear_edge, make_edge, make_cap = self.PARAMS[product]
-        fv_buy = fair_value - take_edge
-        fv_sell = fair_value + take_edge
+
+        # Position-aware "soft" take: if we're short heavily we're willing to buy at FV
+        # exactly (0-edge), and analogously when long. Prevents inventory from getting
+        # pinned at the limit when the book is quiet.
+        soft_trigger = limit // 2  # kick in when |position| >= ~40
+        soft_take_buy = position <= -soft_trigger
+        soft_take_sell = position >= soft_trigger
+        fv_buy = fair_value - (take_edge - 1 if soft_take_buy else take_edge)
+        fv_sell = fair_value + (take_edge - 1 if soft_take_sell else take_edge)
 
         orders: List[Order] = []
         buy_capacity = limit - position
@@ -357,8 +400,10 @@ class Trader:
         best_ask = min(surviving_asks) if surviving_asks else int(round(fair_value + make_edge + 1))
         best_bid = max(surviving_bids) if surviving_bids else int(round(fair_value - make_edge - 1))
 
-        # Inventory skew: shift quotes against our position so we naturally mean-revert inventory.
-        skew = position // 80  # gentle 1-tick inventory lean at max position
+        # One-tick asymmetric nudge when short (Python floor-div gives -1 for pos<0),
+        # which shifts both quotes UP — making our sell quote more aggressive and
+        # our buy quote less aggressive, i.e. biases us to cover the short.
+        skew = -1 if position < 0 else 0
         passive_bid = min(best_bid + 1, int(round(fair_value - make_edge))) - skew
         passive_ask = max(best_ask - 1, int(round(fair_value + make_edge))) - skew
 
@@ -378,7 +423,6 @@ class Trader:
             "pb": int(passive_bid),
             "pa": int(passive_ask),
             "pos": int(position),
-            "skew": int(skew),
             "tb": int(round(fv_buy)),
             "ts": int(round(fv_sell)),
         }

@@ -18,29 +18,152 @@ Design (take–clear–make, per product):
 from __future__ import annotations
 
 import json
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
-from datamodel import Order, OrderDepth, TradingState
+from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
-from prosperity_logger import Logger
+
+class Logger:
+    """jmerle-visualizer / prosperity3bt compatible stdout logger.
+
+    Inlined into the submission because IMC's runtime only uploads a single .py file —
+    a `from prosperity_logger import ...` is not resolvable there.
+    """
+
+    def __init__(self) -> None:
+        self.logs = ""
+        self.max_log_length = 3750
+
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
+        self.logs += sep.join(map(str, objects)) + end
+
+    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
+        base_length = len(
+            self.to_json(
+                [
+                    self.compress_state(state, ""),
+                    self.compress_orders(orders),
+                    conversions,
+                    "",
+                    "",
+                ]
+            )
+        )
+
+        max_item_length = (self.max_log_length - base_length) // 3
+
+        print(
+            self.to_json(
+                [
+                    self.compress_state(state, self.truncate(state.traderData, max_item_length)),
+                    self.compress_orders(orders),
+                    conversions,
+                    self.truncate(trader_data, max_item_length),
+                    self.truncate(self.logs, max_item_length),
+                ]
+            )
+        )
+
+        self.logs = ""
+
+    def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
+        return [
+            state.timestamp,
+            trader_data,
+            self.compress_listings(state.listings),
+            self.compress_order_depths(state.order_depths),
+            self.compress_trades(state.own_trades),
+            self.compress_trades(state.market_trades),
+            state.position,
+            self.compress_observations(state.observations),
+        ]
+
+    def compress_listings(self, listings: dict[Symbol, Listing]) -> list[list[Any]]:
+        compressed = []
+        for listing in listings.values():
+            compressed.append([listing.symbol, listing.product, listing.denomination])
+        return compressed
+
+    def compress_order_depths(self, order_depths: dict[Symbol, OrderDepth]) -> dict[Symbol, list[Any]]:
+        compressed = {}
+        for symbol, order_depth in order_depths.items():
+            compressed[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
+        return compressed
+
+    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
+        compressed = []
+        for arr in trades.values():
+            for trade in arr:
+                compressed.append(
+                    [
+                        trade.symbol,
+                        trade.price,
+                        trade.quantity,
+                        trade.buyer,
+                        trade.seller,
+                        trade.timestamp,
+                    ]
+                )
+        return compressed
+
+    def compress_observations(self, observations: Observation) -> list[Any]:
+        conversion_observations = {}
+        for product, observation in observations.conversionObservations.items():
+            conversion_observations[product] = [
+                observation.bidPrice,
+                observation.askPrice,
+                observation.transportFees,
+                observation.exportTariff,
+                observation.importTariff,
+                observation.sugarPrice,
+                observation.sunlightIndex,
+            ]
+        return [observations.plainValueObservations, conversion_observations]
+
+    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
+        compressed = []
+        for arr in orders.values():
+            for order in arr:
+                compressed.append([order.symbol, order.price, order.quantity])
+        return compressed
+
+    def to_json(self, value: Any) -> str:
+        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
+
+    def truncate(self, value: str, max_length: int) -> str:
+        lo, hi = 0, min(len(value), max_length)
+        out = ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = value[:mid]
+            if len(candidate) < len(value):
+                candidate += "..."
+            encoded_candidate = json.dumps(candidate)
+            if len(encoded_candidate) <= max_length:
+                out = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return out
+
 
 logger = Logger()
 
 
 class Trader:
     POSITION_LIMITS: Dict[str, int] = {
-        "ASH_COATED_OSMIUM": 50,
-        "INTARIAN_PEPPER_ROOT": 50,
+        "ASH_COATED_OSMIUM": 80,
+        "INTARIAN_PEPPER_ROOT": 80,
     }
 
     # OSMIUM is a stable rainforest-resin style asset; fair value is constant.
     OSMIUM_FAIR_VALUE = 10000
 
     # Minimum volume to treat a level as a "market-maker" quote (vs retail fill).
-    MM_VOLUME_THRESHOLD = 15
+    MM_VOLUME_THRESHOLD = 18
 
     # History length for PEPPER_ROOT fair-value smoothing (ticks).
-    PEPPER_HISTORY = 4
+    PEPPER_HISTORY = 5
 
     # Per-product config: (take_edge, clear_edge, make_edge, make_size_cap)
     # - take_edge: take a resting order only if price is >= this many ticks inside FV.
@@ -50,8 +173,8 @@ class Trader:
     PARAMS: Dict[str, Tuple[int, int, int, int]] = {
         # OSMIUM: stable 10000 → edges in ticks off FV.
         # PEPPER_ROOT: adaptive FV; slightly wider make to avoid drift adverse-selection.
-        "ASH_COATED_OSMIUM": (1, 0, 1, 30),
-        "INTARIAN_PEPPER_ROOT": (1, 0, 1, 25),
+        "ASH_COATED_OSMIUM": (1, 0, 1, 50),
+        "INTARIAN_PEPPER_ROOT": (1, 0, 1, 40),
     }
 
     def run(self, state: TradingState):
@@ -104,7 +227,12 @@ class Trader:
         trader_state: Dict[str, List[float]],
     ) -> float | None:
         if product == "ASH_COATED_OSMIUM":
-            return float(self.OSMIUM_FAIR_VALUE)
+            # Constant mean-reversion anchor, but tilt toward the book's micro-price
+            # by a tiny fraction so volume imbalance nudges quotes correctly.
+            micro = self._micro_price(order_depth)
+            if micro is None:
+                return float(self.OSMIUM_FAIR_VALUE)
+            return 0.7 * self.OSMIUM_FAIR_VALUE + 0.3 * micro
 
         # PEPPER_ROOT: use the midpoint of the largest-volume bid/ask as the
         # instantaneous MM-anchored price, then smooth with a short moving
@@ -121,6 +249,7 @@ class Trader:
         if not history:
             return None
         return sum(history) / len(history)
+
 
     def _mm_mid_price(self, order_depth: OrderDepth) -> float | None:
         """Midpoint of the thickest bid and thickest ask (filters retail fills)."""
@@ -142,6 +271,20 @@ class Trader:
             return None
         return (max(order_depth.buy_orders) + min(order_depth.sell_orders)) / 2
 
+    @staticmethod
+    def _micro_price(order_depth: OrderDepth) -> float | None:
+        """Volume-weighted mid: price leans toward the side with LESS liquidity."""
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return None
+        best_bid = max(order_depth.buy_orders)
+        best_ask = min(order_depth.sell_orders)
+        bid_vol = order_depth.buy_orders[best_bid]
+        ask_vol = -order_depth.sell_orders[best_ask]
+        total = bid_vol + ask_vol
+        if total <= 0:
+            return (best_bid + best_ask) / 2
+        return (best_bid * ask_vol + best_ask * bid_vol) / total
+
     # ---------------------------------------------------------- order build
 
     def _build_orders(
@@ -153,8 +296,15 @@ class Trader:
     ):
         limit = self.POSITION_LIMITS[product]
         take_edge, clear_edge, make_edge, make_cap = self.PARAMS[product]
-        fv_buy = fair_value - take_edge
-        fv_sell = fair_value + take_edge
+
+        # Position-aware "soft" take: if we're short heavily we're willing to buy at FV
+        # exactly (0-edge), and analogously when long. Prevents inventory from getting
+        # pinned at the limit when the book is quiet.
+        soft_trigger = limit // 2  # kick in when |position| >= ~40
+        soft_take_buy = position <= -soft_trigger
+        soft_take_sell = position >= soft_trigger
+        fv_buy = fair_value - (take_edge - 1 if soft_take_buy else take_edge)
+        fv_sell = fair_value + (take_edge - 1 if soft_take_sell else take_edge)
 
         orders: List[Order] = []
         buy_capacity = limit - position
@@ -234,8 +384,10 @@ class Trader:
         best_ask = min(surviving_asks) if surviving_asks else int(round(fair_value + make_edge + 1))
         best_bid = max(surviving_bids) if surviving_bids else int(round(fair_value - make_edge - 1))
 
-        # Inventory skew: shift quotes against our position so we naturally mean-revert inventory.
-        skew = position // 50  # gentle 1-tick inventory lean at max position
+        # One-tick asymmetric nudge when short (Python floor-div gives -1 for pos<0),
+        # which shifts both quotes UP — making our sell quote more aggressive and
+        # our buy quote less aggressive, i.e. biases us to cover the short.
+        skew = -1 if position < 0 else 0
         passive_bid = min(best_bid + 1, int(round(fair_value - make_edge))) - skew
         passive_ask = max(best_ask - 1, int(round(fair_value + make_edge))) - skew
 
@@ -255,7 +407,6 @@ class Trader:
             "pb": int(passive_bid),
             "pa": int(passive_ask),
             "pos": int(position),
-            "skew": int(skew),
             "tb": int(round(fv_buy)),
             "ts": int(round(fv_sell)),
         }
