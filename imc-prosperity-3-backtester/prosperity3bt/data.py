@@ -8,6 +8,8 @@ LIMITS = {
     # Tutorial round products (IMC tutorial / custom CSVs)
     "EMERALDS": 80,
     "TOMATOES": 80,
+    "ASH_COATED_OSMIUM": 80,
+    "INTARIAN_PEPPER_ROOT": 80,
     "RAINFOREST_RESIN": 50,
     "KELP": 50,
     "SQUID_INK": 50,
