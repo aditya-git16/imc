@@ -1,40 +1,40 @@
-# IMC Prosperity visualisation
+# IMC Prosperity Visualisation
 
 A local Dash dashboard for inspecting IMC Prosperity submission logs.
 
 ## What it shows
 
-Three stacked panels sharing a timestamp axis:
+Four stacked panels with shared timestamp axis:
 
-1. **Order book & trades** — bid/ask levels 1-3 (blue = bid, red = ask,
-   marker size scales with resting volume, fainter markers for deeper levels),
-   mid-price line, and our own fills as green/red triangles.
-2. **PnL** — the `profit_and_loss` column from the submission activities log.
-3. **Position** — running net inventory from own trades.
+1. **Order book + overlays + own fills**
+   - L1-L3 bid/ask clouds (marker size scales with resting volume)
+   - strategy overlays when available (`fair value`, passive bid/ask)
+   - own buy/sell fills
+2. **PnL** from `activitiesLog.profit_and_loss`
+3. **Position** from cumulative own trades
+4. **Fill edge** per fill and cumulative edge
 
-Hovering any plot prints the algorithm's sandbox/lambda log for the nearest
-tick underneath.
+Hovering any panel shows nearest tick logs (`sandboxLog`, `lambdaLog`) below.
 
-## Log formats
+## Input log formats
 
-- **Submission JSON** — export from the Prosperity site (the shape described in `parse.py`).
-- **prosperity3bt text** — output from `prosperity3bt ... --out path/to/run.log` (same file you load into jmerle’s visualizer). Your trader should use the official `Logger` + `logger.flush()` pattern so both tools see valid `lambdaLog` rows; emit custom `{"DV":...}` via `logger.print()` so this dashboard still gets fair-value overlays.
+- **prosperity3bt text log** (`--out run.log`)
+- **Prosperity API JSON export**
 
-## Install & run
+If `DV` decision payloads are present in `lambdaLog`, the dashboard uses them.
+Otherwise it falls back to derived decisions.
+
+## Install and run
 
 ```bash
 pip install -r viz/requirements.txt
-python -m viz.app --log tutorial_round/pnl_logs/64424/64424.log
+python -m viz.app --log path/to/run.log
 ```
 
-Then open <http://127.0.0.1:8050>.
+Open [http://127.0.0.1:8050](http://127.0.0.1:8050).
 
-## Flags
+## CLI flags
 
-- `--log PATH`   submission `.log` file (required)
-- `--port N`     dev-server port (default 8050)
-- `--debug`      enable Dash hot-reload
-
-The product selector and max-points slider control which product is rendered
-and how aggressively the book snapshots are downsampled (large submissions
-have ~20k rows per product — 5k points is a good default).
+- `--log PATH`: initial `.log` or `.json` file (optional, can load in UI)
+- `--port N`: server port (default `8050`)
+- `--debug`: enable Dash hot reload
